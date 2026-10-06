@@ -7,7 +7,9 @@ import lombok.Getter;
 import lombok.Setter;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
 
 /**
  * 当票聚合根（纯领域对象，不带任何持久化注解）。
@@ -28,6 +30,9 @@ import java.time.LocalDate;
 @Getter
 @Setter
 public class PawnTicket extends BaseEntity {
+
+    /** 日费率分母：月利率、月综合费率都是「每月」口径，折成每天除以 30。 */
+    private static final BigDecimal DAYS_PER_MONTH = BigDecimal.valueOf(30);
 
     private Long id;
 
@@ -147,6 +152,38 @@ public class PawnTicket extends BaseEntity {
 
     public boolean isActive() {
         return status == TicketStatus.ACTIVE;
+    }
+
+    /**
+     * 照票面上的快照算一笔「假设 settleDate 当天就来赎」的应付金额（当金 + 利息与综合费）。
+     *
+     * 待赎提醒清单用它给柜台报数：只认票上那套利率费率快照，不读现在挂在配置里的数，
+     * 老票报出去的价钱不会跟着新配置乱跳。口径与赎当结算（PawnRedeem#apply）完全一致：
+     * 计费天数 = settleDate − 起当日期的自然日数、不足一天按一天算；
+     * 日费率 =（月利率快照 + 月综合费率快照）÷ 30；费用 = 当金 × 日费率 × 计费天数；
+     * 应还总额 = 当金 + 费用；金额保留两位小数、四舍五入。晚于到期日期来赎照实际天数算，不额外加罚。
+     */
+    public RedeemQuote quoteRedeem(LocalDate settleDate) {
+        if (pawnAmount == null || pawnAmount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new BizException("当票当金异常，无法核算应付金额");
+        }
+        if (monthlyRate == null || serviceRate == null) {
+            throw new BizException("当票利率费率快照缺失，无法核算应付金额");
+        }
+        if (startDate == null) {
+            throw new BizException("当票起当日期缺失，无法核算应付金额");
+        }
+        if (settleDate == null) {
+            throw new BizException("核算日期缺失，无法核算应付金额");
+        }
+        int usedDays = (int) Math.max(1L, ChronoUnit.DAYS.between(startDate, settleDate));
+        BigDecimal dailyRate = monthlyRate.add(serviceRate)
+                .divide(DAYS_PER_MONTH, 10, RoundingMode.HALF_UP);
+        BigDecimal fee = pawnAmount.multiply(dailyRate)
+                .multiply(BigDecimal.valueOf(usedDays))
+                .setScale(2, RoundingMode.HALF_UP);
+        BigDecimal total = pawnAmount.add(fee).setScale(2, RoundingMode.HALF_UP);
+        return new RedeemQuote(usedDays, fee, total);
     }
 
     /** 只有在当的票才办得动这个操作；已赎 / 已绝当 / 已撤销都是定了案的历史票。 */
